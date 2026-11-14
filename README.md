@@ -39,3 +39,5 @@ DATABASE_URL=postgres://app:app@localhost:5432/app_test npm run test:integration
 Gatilho: Pull Request para `main`.
 
 `lint` + `format` + `security` (paralelos) → `build` → `unit-tests` → `integration-tests` → `docker`
+
+//Github
