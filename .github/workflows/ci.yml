@@ -1,0 +1,185 @@
+name: CI
+
+# Gatilho: Pull Request para a branch main
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+# Cancela execuções antigas do mesmo PR
+concurrency:
+  group: ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: 20
+
+jobs:
+  # ---------------------------------------------------------------
+  # ETAPA 1 - Verificações estáticas (rápidas, não executam o código)
+  # ---------------------------------------------------------------
+  lint:
+    name: Análise estática de código (ESLint + TypeScript)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+
+  format:
+    name: Análise de formatação (Prettier)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run format:check
+
+  security:
+    name: Análise estática de segurança (CodeQL + npm audit)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - name: Auditoria de dependências (npm audit)
+        run: |
+          npm ci
+          npm run audit:prod
+      - name: Inicializar CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript-typescript
+          queries: security-extended
+      - name: Executar análise CodeQL
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: /language:javascript-typescript
+
+  # ---------------------------------------------------------------
+  # ETAPA 2 - Build (só roda se as análises estáticas passaram)
+  # ---------------------------------------------------------------
+  build:
+    name: Build
+    needs: [lint, format, security]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          retention-days: 3
+
+  # ---------------------------------------------------------------
+  # ETAPA 3 - Testes (unitário antes do de integração)
+  # ---------------------------------------------------------------
+  unit-tests:
+    name: Teste unitário
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run test:unit -- --coverage
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-unit
+          path: coverage/
+          retention-days: 3
+
+  integration-tests:
+    name: Teste de integração (PostgreSQL)
+    needs: unit-tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: app
+          POSTGRES_DB: app_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U app -d app_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgres://app:app@localhost:5432/app_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run test:integration
+
+  # ---------------------------------------------------------------
+  # ETAPA 4 - Imagem Docker (só após tudo aprovado)
+  # ---------------------------------------------------------------
+  docker:
+    name: Criação da imagem Docker
+    needs: integration-tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Construir imagem
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: tarefas-api:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Teste de fumaça da imagem (API + PostgreSQL em containers)
+        run: |
+          docker network create ci-net
+          docker run -d --name db --network ci-net \
+            -e POSTGRES_USER=app -e POSTGRES_PASSWORD=app -e POSTGRES_DB=tarefas \
+            postgres:16-alpine
+          for i in $(seq 1 30); do
+            docker exec db pg_isready -U app -d tarefas && break
+            sleep 2
+          done
+          docker run -d --name api --network ci-net -p 3000:3000 \
+            -e DATABASE_URL=postgres://app:app@db:5432/tarefas \
+            tarefas-api:${{ github.sha }}
+          for i in $(seq 1 30); do
+            curl -fsS http://localhost:3000/health && exit 0
+            sleep 2
+          done
+          docker logs api
+          exit 1
